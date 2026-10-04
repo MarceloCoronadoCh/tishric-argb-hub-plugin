@@ -249,17 +249,26 @@ function channelColor(idx) {
 	try { cc = device.channel(ChannelArray[idx][0]); } catch (e) { cc = null; }
 	if (!cc) return [0, 0, 0];
 
-	// Always touch the pulse API every frame so the UI pulse registers as
-	// consumed (otherwise SignalRGB kills the pulse after ~4s).
-	// The pulse color replaces this port's color while the pulse is active.
-	let pulseColor = null;
-	try { pulseColor = device.getChannelPulseColor(ChannelArray[idx][0]); } catch (e) { /* none */ }
-	if (pulseColor) {
-		return toRgb(pulseColor);
+	const lc = getLedCount(cc);
+
+	// Official plugin pattern (Lian Li / Airgoo):
+	//  - empty channel: show the channel pulse color (locate/identify feature)
+	//  - assigned channel: use the pulse color ONLY while the pulse is active,
+	//    otherwise stream the component colors.
+	// Both paths consume the pulse every frame so SignalRGB doesn't kill it.
+	if (!lc) {
+		try {
+			return toRgb(device.getChannelPulseColor(ChannelArray[idx][0]));
+		} catch (e) { /* fall through */ }
+		return [0, 0, 0];
 	}
 
-	const lc = getLedCount(cc);
-	if (!lc) return [0, 0, 0];
+	try {
+		if (typeof cc.shouldPulseColors === "function" && cc.shouldPulseColors()) {
+			return toRgb(device.getChannelPulseColor(ChannelArray[idx][0]));
+		}
+	} catch (e) { /* fall through */ }
+
 	try {
 		return averageColor(cc.getColors("Inline"));
 	} catch (e) {
