@@ -222,6 +222,7 @@ function hsvToRgb(h, s, v) {
 // ---- port state ----
 const lastSent = [];   // last color key per port (dedupe writes)
 const modeSet = [];    // 0x05 mode frame sent once per port (avoid flicker)
+const fadedColor = []; // current smoothed color per port (lerp towards target)
 let frameCounter = 0;  // round-robin pointer
 
 // ---- channel color resolution ----
@@ -332,6 +333,7 @@ export function Initialize() {
 		// reset per-port state on (re)connect
 		lastSent.length = 0;
 		modeSet.length = 0;
+		fadedColor.length = 0;
 
 		device.log("TISHRIC v5 initialized (vendor per-port protocol)");
 	} catch (e) {
@@ -398,26 +400,37 @@ function renderFrame() {
 		return;
 	}
 
-	// Per-port static mode — ROUND-ROBIN: the CH552 firmware only reliably
-	// processes a couple of frames per burst (observed drops with 20 writes
-	// per frame). Sending ONE port per frame (30fps => each port refreshes
-	// every 10 frames ≈ 330ms) keeps every port responsive.
+	// Per-port static mode — ROUND-ROBIN: one port per frame. With the color
+	// lerp below, each port's transition becomes several small steps across
+	// consecutive turns => smooth fades. 30fps / 10 ports = 3 turns/s/port.
 	const startIdx = frameCounter;
 	let wroteAny = false;
 	for (let k = 0; k < PortCount; k++) {
 		const p = (startIdx + k) % PortCount;
-		const c = colors[p];
-		const key = `${c[0]},${c[1]},${c[2]}`;
+		const target = colors[p];
+
+		// Smooth transition: ease current color 35% towards the target each
+		// visit; snap when close (or when the target is a forced/flat color).
+		let fc = fadedColor[p];
+		if (!fc) fc = fadedColor[p] = [target[0], target[1], target[2]];
+		const doneFade = Math.abs(target[0] - fc[0]) <= 2 && Math.abs(target[1] - fc[1]) <= 2 && Math.abs(target[2] - fc[2]) <= 2;
+		const next = doneFade
+			? [target[0], target[1], target[2]]
+			: [
+				Math.round(fc[0] + (target[0] - fc[0]) * 0.35),
+				Math.round(fc[1] + (target[1] - fc[1]) * 0.35),
+				Math.round(fc[2] + (target[2] - fc[2]) * 0.35),
+			];
+		fadedColor[p] = next;
+
+		const key = `${next[0]},${next[1]},${next[2]}`;
 		if (lastSent[p] === key) continue;
-		// The 0x05 mode frame momentarily resets the port (visible flash) —
-		// send it ONLY ONCE per port (per session/reconnect), then update
-		// colors with the retained-config frame alone.
 		if (!modeSet[p]) {
 			writeFrame(setPortMode(p, 1));
 			device.pause(50);
 			modeSet[p] = true;
 		}
-		writeFrame(perPortColorFrame(p, c, b));
+		writeFrame(perPortColorFrame(p, next, b));
 		device.pause(2);
 		lastSent[p] = key;
 		wroteAny = true;
