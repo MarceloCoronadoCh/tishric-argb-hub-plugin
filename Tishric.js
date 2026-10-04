@@ -406,9 +406,9 @@ function renderFrame() {
 		if (lastSent[p] === key) continue;
 		// first changed port this frame only:
 		writeFrame(setPortMode(p, 1));
-		device.pause(2);
+		device.pause(50);
 		writeFrame(perPortColorFrame(p, c, b));
-		device.pause(2);
+		device.pause(50);
 		lastSent[p] = key;
 		wroteAny = true;
 		break;
