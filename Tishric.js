@@ -220,10 +220,57 @@ function hsvToRgb(h, s, v) {
 }
 
 // ---- port state ----
-const lastSent = [];   // last color key per port (dedupe writes)
-const modeSet = [];    // 0x05 mode frame sent once per port (avoid flicker)
-const fadedColor = []; // current smoothed color per port (lerp towards target)
-let frameCounter = 0;  // round-robin pointer
+const lastSent = [];     // last color key per port (dedupe writes)
+const modeSet = [];      // 0x05 mode frame sent once per port (avoid flicker)
+const fadedColor = [];   // current smoothed color per port (lerp towards target)
+const lastPalette = [];  // last sent palette hash per port (palette-mode dedupe)
+let frameCounter = 0;    // round-robin pointer
+const PaletteTurns = 2;  // refresh palettes at ~1Hz (each port every PaletteTurns×PortCount frames)
+
+// Palette sampling from a channel's color stream (12 slots spread across it)
+function samplePalette(cc, lc) {
+	const data = cc.getColors("Inline");
+	const n = Math.floor(data.length / 3);
+	if (n === 0) return null;
+	const slots = 12;
+	const pal = [];
+	let step = 0;
+	for (let i = 0; i < slots; i++) {
+		const idx = Math.min(n - 1, Math.floor((i * n) / slots));
+		pal.push([data[idx * 3] & 0xFF, data[idx * 3 + 1] & 0xFF, data[idx * 3 + 2] & 0xFF]);
+		step += 1;
+	}
+	return pal;
+}
+
+function isStaticPalette(pal) {
+	// all colors within small delta?
+	if (!pal) return true;
+	const c0 = pal[0];
+	for (let i = 1; i < pal.length; i++) {
+		const c = pal[i];
+		if (Math.abs(c[0] - c0[0]) > 6 || Math.abs(c[1] - c0[1]) > 6 || Math.abs(c[2] - c0[2]) > 6) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function paletteFrame(port, palette, brightness) {
+	const b = brightness & 0xFF;
+	const p = [
+		0x04,
+		0x01, 0x01, 0x01, 0x01, 0x01,
+		0x00, 0x03, 0x03, 0x03,
+		0x01, 0x01, 0x01,
+		b, b, b,
+	];
+	for (let i = 0; i < 12; i++) {
+		const c = palette && palette[i] ? palette[i] : [0, 0, 0];
+		p.push(c[0] & 0xFF, c[1] & 0xFF, c[2] & 0xFF);
+	}
+	return buildFrame(0x03, [0xFD, port & 0xFF].concat(p.slice(0, 52)));
+}
 
 // ---- channel color resolution ----
 
@@ -400,45 +447,71 @@ function renderFrame() {
 		return;
 	}
 
-	// Per-port static mode — ROUND-ROBIN: one port per frame. With the color
-	// lerp below, each port's transition becomes several small steps across
-	// consecutive turns => smooth fades. 30fps / 10 ports = 3 turns/s/port.
+	// Per-port firmware-palette mode — round-robin 1 port per frame.
+	// The firmware cycles/interpolates the palette BY ITSELF => smooth
+	// animation without streaming. Static streams set mode 1 (fixed color).
 	const startIdx = frameCounter;
-	let wroteAny = false;
-	for (let k = 0; k < PortCount; k++) {
-		const p = (startIdx + k) % PortCount;
-		const target = colors[p];
-
-		// Smooth transition: ease current color 18% towards the target each
-		// visit; snap when close (or when the target is a forced/flat color).
-		let fc = fadedColor[p];
-		if (!fc) fc = fadedColor[p] = [target[0], target[1], target[2]];
-		const doneFade = Math.abs(target[0] - fc[0]) <= 1.5 && Math.abs(target[1] - fc[1]) <= 1.5 && Math.abs(target[2] - fc[2]) <= 1.5;
-		const next = doneFade
-			? [target[0], target[1], target[2]]
-			: [
-				Math.round(fc[0] + (target[0] - fc[0]) * 0.18),
-				Math.round(fc[1] + (target[1] - fc[1]) * 0.18),
-				Math.round(fc[2] + (target[2] - fc[2]) * 0.18),
-			];
-		fadedColor[p] = next;
-
-		const key = `${next[0]},${next[1]},${next[2]}`;
-		if (lastSent[p] === key) continue;
-		if (!modeSet[p]) {
-			writeFrame(setPortMode(p, 1));
-			device.pause(50);
-			modeSet[p] = true;
-		}
-		writeFrame(perPortColorFrame(p, next, b));
-		device.pause(2);
-		lastSent[p] = key;
-		wroteAny = true;
-		break;
-	}
 	frameCounter = (frameCounter + 1) % PortCount;
-	// if nothing changed we still keep the round-robin pointer moving slowly
-	if (!wroteAny) frameCounter = (frameCounter + 3) % PortCount;
+
+	const p = startIdx;
+	let cc = null;
+	try { cc = device.channel(ChannelArray[p][0]); } catch (e) { cc = null; }
+	if (!cc) return;
+	const lc = getLedCount(cc);
+	if (!lc) {
+		// empty port: mirror the locate pulse if active; else keep black
+		try {
+			if (typeof cc.shouldPulseColors === "function" && cc.shouldPulseColors()) {
+				const pc = applyOrder(toRgb(device.getChannelPulseColor(ChannelArray[p][0], 40)));
+				writeFrame(setPortMode(p, 1));
+				device.pause(20);
+				writeFrame(perPortColorFrame(p, pc, b));
+				lastSent[p] = `p:${pc[0]},${pc[1]},${pc[2]}`;
+			} else if ((lastSent[p] || "black") !== "black") {
+				writeFrame(perPortColorFrame(p, [0, 0, 0], b));
+				lastSent[p] = "black";
+			}
+		} catch (e) { /* */ }
+		return;
+	}
+
+	// Assigned port: sample the canvas stream into a palette
+	let pal = null;
+	try {
+		pal = samplePalette(cc, lc);
+	} catch (e) {
+		device.log(`Port ${p + 1}: palette error ${e}`);
+		return;
+	}
+	if (!pal) return;
+
+	if (isStaticPalette(pal)) {
+		// static stream: mode 1 with palette[0] = the color (retained by firmware)
+		const c = applyOrder(pal[0]);
+		const key = `s:${c[0]},${c[1]},${c[2]}`;
+		if (lastSent[p] !== key) {
+			// 0x05 only when the MODE changes (static <-> cycling); re-sending
+			// it resets the firmware effect and flashes the port.
+			if (!lastSent[p] || !lastSent[p].startsWith("s:")) {
+				writeFrame(setPortMode(p, 1));
+				device.pause(50);
+			}
+			writeFrame(perPortColorFrame(p, c, b));
+			lastSent[p] = key;
+		}
+	} else {
+		// animated stream: firmware cycles the palette (mode 2) + palette refresh
+		const palApplied = pal.map(applyOrder);
+		const key = `p:${palApplied.map(c => `${c[0]},${c[1]},${c[2]}`).join(";")}`;
+		if (lastSent[p] === key) return;
+		// mode frame only when switching from a different mode
+		if (!lastSent[p] || !lastSent[p].startsWith("p:")) {
+			writeFrame(setPortMode(p, 2));
+			device.pause(20);
+		}
+		writeFrame(paletteFrame(p, palApplied, b));
+		lastSent[p] = key;
+	}
 }
 
 function mixOf(colors) {
