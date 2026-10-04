@@ -248,13 +248,17 @@ function channelColor(idx) {
 	let cc = null;
 	try { cc = device.channel(ChannelArray[idx][0]); } catch (e) { cc = null; }
 	if (!cc) return [0, 0, 0];
+
+	// Always touch the pulse API every frame so the UI pulse registers as
+	// consumed (otherwise SignalRGB kills the pulse after ~4s).
+	// The pulse color replaces this port's color while the pulse is active.
+	let pulseColor = null;
+	try { pulseColor = device.getChannelPulseColor(ChannelArray[idx][0]); } catch (e) { /* none */ }
+	if (pulseColor) {
+		return toRgb(pulseColor);
+	}
+
 	const lc = getLedCount(cc);
-	try {
-		if (typeof cc.shouldPulseColors === "function" && cc.shouldPulseColors()) {
-			// mirror the UI pulse live (both for assigned and empty channels)
-			return toRgb(device.getChannelPulseColor(ChannelArray[idx][0]));
-		}
-	} catch (e) { /* fall through */ }
 	if (!lc) return [0, 0, 0];
 	try {
 		return averageColor(cc.getColors("Inline"));
