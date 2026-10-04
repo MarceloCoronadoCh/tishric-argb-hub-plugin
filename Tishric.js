@@ -409,17 +409,17 @@ function renderFrame() {
 		const p = (startIdx + k) % PortCount;
 		const target = colors[p];
 
-		// Smooth transition: ease current color 35% towards the target each
+		// Smooth transition: ease current color 18% towards the target each
 		// visit; snap when close (or when the target is a forced/flat color).
 		let fc = fadedColor[p];
 		if (!fc) fc = fadedColor[p] = [target[0], target[1], target[2]];
-		const doneFade = Math.abs(target[0] - fc[0]) <= 2 && Math.abs(target[1] - fc[1]) <= 2 && Math.abs(target[2] - fc[2]) <= 2;
+		const doneFade = Math.abs(target[0] - fc[0]) <= 1.5 && Math.abs(target[1] - fc[1]) <= 1.5 && Math.abs(target[2] - fc[2]) <= 1.5;
 		const next = doneFade
 			? [target[0], target[1], target[2]]
 			: [
-				Math.round(fc[0] + (target[0] - fc[0]) * 0.35),
-				Math.round(fc[1] + (target[1] - fc[1]) * 0.35),
-				Math.round(fc[2] + (target[2] - fc[2]) * 0.35),
+				Math.round(fc[0] + (target[0] - fc[0]) * 0.18),
+				Math.round(fc[1] + (target[1] - fc[1]) * 0.18),
+				Math.round(fc[2] + (target[2] - fc[2]) * 0.18),
 			];
 		fadedColor[p] = next;
 
