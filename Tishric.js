@@ -221,6 +221,7 @@ function hsvToRgb(h, s, v) {
 
 // ---- port state ----
 const lastSent = [];   // last color key per port (dedupe writes)
+let frameCounter = 0;  // round-robin pointer
 
 // ---- channel color resolution ----
 
@@ -392,17 +393,29 @@ function renderFrame() {
 		return;
 	}
 
-	// Per-port static mode: send only changes (firmware retains colors)
-	for (let p = 0; p < PortCount; p++) {
+	// Per-port static mode — ROUND-ROBIN: the CH552 firmware only reliably
+	// processes a couple of frames per burst (observed drops with 20 writes
+	// per frame). Sending ONE port per frame (30fps => each port refreshes
+	// every 10 frames ≈ 330ms) keeps every port responsive.
+	const startIdx = frameCounter;
+	let wroteAny = false;
+	for (let k = 0; k < PortCount; k++) {
+		const p = (startIdx + k) % PortCount;
 		const c = colors[p];
 		const key = `${c[0]},${c[1]},${c[2]}`;
 		if (lastSent[p] === key) continue;
+		// first changed port this frame only:
 		writeFrame(setPortMode(p, 1));
-		device.pause(1);
+		device.pause(2);
 		writeFrame(perPortColorFrame(p, c, b));
-		device.pause(1);
+		device.pause(2);
 		lastSent[p] = key;
+		wroteAny = true;
+		break;
 	}
+	frameCounter = (frameCounter + 1) % PortCount;
+	// if nothing changed we still keep the round-robin pointer moving slowly
+	if (!wroteAny) frameCounter = (frameCounter + 3) % PortCount;
 }
 
 function mixOf(colors) {
