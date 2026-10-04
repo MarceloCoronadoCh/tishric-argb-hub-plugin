@@ -221,6 +221,7 @@ function hsvToRgb(h, s, v) {
 
 // ---- port state ----
 const lastSent = [];   // last color key per port (dedupe writes)
+const modeSet = [];    // 0x05 mode frame sent once per port (avoid flicker)
 let frameCounter = 0;  // round-robin pointer
 
 // ---- channel color resolution ----
@@ -328,6 +329,10 @@ export function Initialize() {
 		writeFrame(takeOwnership());
 		writeFrame(fanSwitchTake());
 
+		// reset per-port state on (re)connect
+		lastSent.length = 0;
+		modeSet.length = 0;
+
 		device.log("TISHRIC v5 initialized (vendor per-port protocol)");
 	} catch (e) {
 		device.log("Initialize error: " + e);
@@ -404,11 +409,16 @@ function renderFrame() {
 		const c = colors[p];
 		const key = `${c[0]},${c[1]},${c[2]}`;
 		if (lastSent[p] === key) continue;
-		// first changed port this frame only:
-		writeFrame(setPortMode(p, 1));
-		device.pause(50);
+		// The 0x05 mode frame momentarily resets the port (visible flash) —
+		// send it ONLY ONCE per port (per session/reconnect), then update
+		// colors with the retained-config frame alone.
+		if (!modeSet[p]) {
+			writeFrame(setPortMode(p, 1));
+			device.pause(50);
+			modeSet[p] = true;
+		}
 		writeFrame(perPortColorFrame(p, c, b));
-		device.pause(50);
+		device.pause(2);
 		lastSent[p] = key;
 		wroteAny = true;
 		break;
