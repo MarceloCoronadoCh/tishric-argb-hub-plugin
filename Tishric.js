@@ -251,21 +251,24 @@ function channelColor(idx) {
 
 	const lc = getLedCount(cc);
 
-	// Official plugin pattern (Lian Li / Airgoo):
-	//  - empty channel: show the channel pulse color (locate/identify feature)
-	//  - assigned channel: use the pulse color ONLY while the pulse is active,
-	//    otherwise stream the component colors.
-	// Both paths consume the pulse every frame so SignalRGB doesn't kill it.
+	// Pulse handling (official docs pattern). NOTE: getChannelPulseColor()
+	// returns the channel's pulse color even when no pulse is running, so it
+	// must ONLY be consulted when we actually want the pulse:
+	//   - empty channel: pulse color as the "locate" feature
+	//   - assigned channel: pulse color only while shouldPulseColors() is true
 	if (!lc) {
 		try {
-			return toRgb(device.getChannelPulseColor(ChannelArray[idx][0]));
+			return toRgb(device.getChannelPulseColor(ChannelArray[idx][0], 40));
 		} catch (e) { /* fall through */ }
 		return [0, 0, 0];
 	}
 
 	try {
-		if (typeof cc.shouldPulseColors === "function" && cc.shouldPulseColors()) {
-			return toRgb(device.getChannelPulseColor(ChannelArray[idx][0]));
+		const pulsing = typeof cc.shouldPulseColors === "function"
+			? cc.shouldPulseColors()
+			: false;
+		if (pulsing) {
+			return toRgb(device.getChannelPulseColor(ChannelArray[idx][0], lc));
 		}
 	} catch (e) { /* fall through */ }
 
