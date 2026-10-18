@@ -390,6 +390,14 @@ export function Initialize() {
 		writeFrame(takeOwnership());
 		writeFrame(fanSwitchTake());
 
+		// Restore port types (vendor argb_fan_set(port, 1)): the hub loses
+		// them after a 0xFA reset / power cycle — without this the uniform
+		// broadcast is ignored and ports fall back to the factory effect.
+		for (let i = 0; i < PortCount; i++) {
+			writeFrame(setPortMode(i, 1));
+			device.pause(2);
+		}
+
 		// reset per-port state on (re)connect
 		lastSent.length = 0;
 		modeSet.length = 0;
