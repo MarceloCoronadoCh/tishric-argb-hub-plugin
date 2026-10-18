@@ -62,6 +62,7 @@ forcedColor:readonly
 portTest:readonly
 controlMode:readonly
 hwBrightness:readonly
+effectSpeed:readonly
 colorOrder:readonly
 debugLog:readonly
 */
@@ -73,6 +74,7 @@ export function ControllableParameters() {
 		{ property: "forcedColor", group: "lighting", label: "Forced Color", description: "The color used when 'Forced' Lighting Mode is enabled", min: "0", max: "360", type: "color", default: "#009bde" },
 		{ property: "controlMode", group: "lighting", label: "Control Mode", description: "Ports: each channel = one hub port with its own static color (live-cached). Uniform: all channels share one animated color", type: "combobox", values: ["Ports (static per section)", "Uniform (animated broadcast)"], default: "Ports (static per section)" },
 		{ property: "hwBrightness", group: "lighting", label: "Hub Brightness", description: "Brightness applied to port payloads (0-255, vendor default 0x99 = 153)", type: "number", min: "0", max: "255", default: "153" },
+		{ property: "effectSpeed", group: "lighting", label: "Hub Flow Speed", description: "Firmware effect speed (0-6, vendor slider). Affects palette cycling in dynamic sections", type: "number", min: "0", max: "6", default: "3" },
 		{ property: "portTest", group: "porttest", label: "Port Test Mode", description: "Diagnostic: identify physical hub ports. Effects are NOT rendered while active. Set back to Off when done.", type: "combobox", values: ["Off", "One port at a time", "All white", "Rainbow by port"], default: "Off" },
 		{ property: "colorOrder", group: "lighting", label: "Color Order", description: "Change only if colors look wrong (red/blue swapped)", type: "combobox", values: ["RGB", "RBG", "GRB", "BGR"], default: "RGB" },
 		{ property: "debugLog", group: "", label: "Log hub responses", description: "Reads and logs hub responses every 3 seconds (for debugging)", type: "boolean", default: "false" },
@@ -157,13 +159,16 @@ function uniformFrame(rgb, brightness) {
 }
 
 // Per-port static payload (52 bytes) — byte-verified against the vendor app capture:
-//   04 | 01 01 01 01 01 | 00 03 03 03 | 01 01 01 | B B B | palette: 12 RGB triplets
-// palette[0] = the port's color; remaining slots black.
+//   [0]   = firmware effect id (0..29; 4 = custom palette playback)
+//   [1]   = flow speed 0..6  (vendor "liusu": (60-slider)/10 → 0..6)
+//   [2..15]= effect params | [12..14] = brightness x3 | [16..51] = 12 RGB triplets
+// staticPayload: palette[0] = the port's color; remaining slots black.
 function staticPayload(rgb, brightness) {
 	const b = brightness & 0xFF;
 	const p = [
 		0x04,
-		0x01, 0x01, 0x01, 0x01, 0x01,
+		currentSpeedByte(),
+		0x01, 0x01, 0x01, 0x01,
 		0x00, 0x03, 0x03, 0x03,
 		0x01, 0x01, 0x01,
 		b, b, b,
@@ -175,6 +180,12 @@ function staticPayload(rgb, brightness) {
 
 function setPortMode(port, mode) {
 	return buildFrame(0x05, [port & 0xFF, mode & 0xFF]);
+}
+
+// Firmware flow speed byte (vendor "liusu"): valid range 0..6, default 1 when unset
+function currentSpeedByte() {
+	const v = Number(effectSpeed);
+	return (Number.isFinite(v) && v >= 0 && v <= 6) ? (v | 0) : 0x01;
 }
 
 function perPortColorFrame(port, rgb, brightness) {
@@ -225,6 +236,7 @@ const modeSet = [];      // 0x05 mode frame sent once per port (avoid flicker)
 const fadedColor = [];   // current smoothed color per port (lerp towards target)
 const lastPalette = [];  // last sent palette hash per port (palette-mode dedupe)
 let frameCounter = 0;    // round-robin pointer
+let lastSpeedApplied = -1; // re-send palettes when the flow speed setting changes
 const PaletteTurns = 2;  // refresh palettes at ~1Hz (each port every PaletteTurns×PortCount frames)
 
 // Palette sampling from a channel's color stream (12 slots spread across it)
@@ -260,7 +272,8 @@ function paletteFrame(port, palette, brightness) {
 	const b = brightness & 0xFF;
 	const p = [
 		0x04,
-		0x01, 0x01, 0x01, 0x01, 0x01,
+		currentSpeedByte(),
+		0x01, 0x01, 0x01, 0x01,
 		0x00, 0x03, 0x03, 0x03,
 		0x01, 0x01, 0x01,
 		b, b, b,
@@ -381,6 +394,8 @@ export function Initialize() {
 		lastSent.length = 0;
 		modeSet.length = 0;
 		fadedColor.length = 0;
+		lastPalette.length = 0;
+		lastSpeedApplied = currentSpeedByte();
 
 		device.log("TISHRIC v5 initialized (vendor per-port protocol)");
 	} catch (e) {
@@ -432,6 +447,15 @@ function renderFrame() {
 	}
 
 	const b = hwBrightness & 0xFF;
+
+	// Force palette re-send when the flow-speed setting changes
+	const speedNow = currentSpeedByte();
+	if (lastSpeedApplied !== -1 && speedNow !== lastSpeedApplied) {
+		for (let i = 0; i < PortCount; i++) {
+			if (typeof lastSent[i] === "string" && lastSent[i].startsWith("p:")) lastSent[i] = null;
+		}
+	}
+	lastSpeedApplied = speedNow;
 
 	// per-port colors (pulse-aware)
 	const colors = [];
