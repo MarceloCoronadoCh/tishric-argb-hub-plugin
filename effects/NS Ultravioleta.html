@@ -1,0 +1,105 @@
+<head>
+  <title>NS Ultravioleta</title>
+
+  <meta description="Preset Ultravioleta: Violeta electrico, violeta pastel y lila profundo. (Neon Shift con TUS colores: el mismo look neon suave del original, pero elegis que colores se ven afectados (2-4 colores), la velocidad, y la intensidad del glow."/>
+  <meta publisher="MarceloCoronadoCh" />
+
+  <meta property="color1" label="Color 1" tooltip="Primer color del ciclo" type="color" min="0" max="360" default="#4B3FE4">
+  <meta property="color2" label="Color 2" tooltip="Segundo color del ciclo" type="color" min="0" max="360" default="#9F94FA">
+  <meta property="color3" label="Color 3" tooltip="Tercer color del ciclo (si Cantidad >= 3)" type="color" min="0" max="360" default="#6E5BF0">
+  <meta property="color4" label="Color 4" tooltip="Cuarto color (solo si Cantidad = 4)" type="color" min="0" max="360" default="#E383C0">
+  <meta property="cantidades" label="Cantidad de colores" tooltip="Cuantos colores del ciclo usar" type="combobox" values="2,3,4" default="3">
+  <meta property="speed" label="Velocidad del shift" tooltip="Cada cuanto cambia de color" type="number" min="0" max="100" default="50">
+  <meta property="intensidad" label="Intensidad del glow" tooltip="Brillo al que converge cada color (50% = moody, 100% = neon pleno)" type="number" min="10" max="100" default="80">
+</head>
+
+<body style="margin: 0; padding: 0; background: black;">
+  <canvas id="exCanvas" width="320" height="200"></canvas>
+</body>
+
+<script>
+  console.clear();
+
+  var c = document.getElementById("exCanvas");
+  var ctx = c.getContext("2d");
+  var width = 320;
+  var height = 200;
+
+  var phase = 0;
+  var currColorIdx = 0;
+  var userHsl = [];
+  var lastSig = "";
+
+  // Rebuild the HSL palette whenever any color/parameter changes
+  function refreshPalette() {
+    var n = parseInt(cantidades, 10);
+    if (n !== 2 && n !== 3 && n !== 4) n = 4;
+    var picked = [color1, color2, color3, color4].slice(0, n);
+    userHsl = [];
+    for (var i = 0; i < picked.length; i++) {
+      userHsl.push(hexToHSL(picked[i]));
+    }
+    if (currColorIdx >= userHsl.length) currColorIdx = 0;
+  }
+
+  function paletteSig() {
+    return [color1, color2, color3, color4, cantidades].join("|");
+  }
+
+  function drawShift() {
+    if (!userHsl.length || paletteSig() !== lastSig) {
+      lastSig = paletteSig();
+      refreshPalette();
+    }
+
+    var hsl = userHsl[currColorIdx] || [200, 60, 70];
+    var l = Math.max(2, Math.round(hsl[2] * (parseInt(intensidad, 10) || 70) / 100));
+
+    // Neon accumulation: 5% alpha wash converging on the (scaled) color
+    ctx.fillStyle = "hsla(" + hsl[0] + ", " + hsl[1] + "%, " + l + "%, .05)";
+    ctx.fillRect(0, 0, width, height);
+
+    phase += speed / 4;
+    if (phase > 500) {
+      phase = 0;
+      currColorIdx++;
+      if (currColorIdx >= userHsl.length) currColorIdx = 0;
+    }
+  }
+
+  function update() {
+    drawShift();
+    window.requestAnimationFrame(update);
+  }
+
+  function hexToHSL(hex) {
+    const [, r, g, b] = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex) || [];
+    if (r === undefined) return [200, 60, 70];
+    const rgb = [r, g, b].map(x => parseInt(x, 16) / 255);
+    const max = Math.max(...rgb);
+    const min = Math.min(...rgb);
+    const l = (max + min) / 2;
+
+    if (max === min) return [0, 0, Math.round(l * 100)];
+
+    const d = max - min;
+    const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+
+    let h;
+    const [nr, ng, nb] = rgb;
+    if (max === nr) h = (ng - nb) / d + (ng < nb ? 6 : 0);
+    else if (max === ng) h = (nb - nr) / d + 2;
+    else h = (nr - ng) / d + 4;
+
+    return [Math.round(h * 60), Math.round(s * 100), Math.round(l * 100)];
+  }
+
+  // SignalRGB invokes on<Param>Changed on edits; refresh immediately
+  function oncolor1Changed() { lastSig = ""; }
+  function oncolor2Changed() { lastSig = ""; }
+  function oncolor3Changed() { lastSig = ""; }
+  function oncolor4Changed() { lastSig = ""; }
+  function oncantidadesChanged() { lastSig = ""; }
+
+  window.requestAnimationFrame(update);
+</script>

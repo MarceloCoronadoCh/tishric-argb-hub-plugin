@@ -32,11 +32,21 @@ the USB 2.0 header** — the 3-pin ARGB connector is **not** used.
 
 - **10 channels** in SignalRGB (Port 1..10): drag components (fan rings, pump,
   strips) onto each port and set its LED count.
-- **Per-port static color**: each port keeps its own independent color, matching
-  what the official app can do — colors are only written when they change
-  (the firmware retains them).
+- **Per-port animated lighting**: each port samples its canvas stream into a
+  12-color palette and the firmware cycles/interpolates it on its own — smooth
+  animation per section without heavy streaming (type 2). Fully static
+  streams switch the port to a fixed-color mode (type 1) with zero ongoing
+  traffic; degenerate (monochrome) palettes inside the palette-playback mode
+  hold the last palette briefly instead of flipping modes (avoids the
+  firmware's green glitch).
+- **Hub Flow Speed** setting (0-6, vendor "liusu"): controls how fast the
+  firmware cycles the palettes.
 - **Uniform animated mode** (optional): streams one animated color for all
   channels at full frame rate.
+- **Custom effects included** (`effects/`): "Neon Shift (Custom)" and its
+  "NS Ultravioleta" preset — drop-in HTML effects for SignalRGB with your own
+  selectable colors. Copy them to
+  `%USERPROFILE%\Documents\WhirlwindFX\Effects\Custom\`.
 - Port Test Mode (identify physical ports), channel Pulse mirroring, global
   brightness, color-order adjustment, configurable shutdown color.
 - Keeps the vendor heartbeat so the hub doesn't freeze.
@@ -79,30 +89,67 @@ Frames are 64-byte HID reports written with a leading report-id `0x00`:
 | CMD | Meaning | Frame |
 | --- | --- | --- |
 | `0x00` | heartbeat / info | `52 42 06 00 00 9A` |
-| `0x01` | channel detect (×10) | `52 42 07 00 01 FF` |
-| `0x03` | lighting (uniform or per-port) | `52 42 3C 00 03 ...` |
-| `0x05` | set port mode/value | `52 42 08 00 05 <port> <value>` |
-| `0x08` | fan switch / speed ownership | `52 42 08 00 08 <flag>` |
+| `0x01` | channel detect (×10) → `0x39` map | `52 42 07 00 01 FF` |
+| `0x02` | set ONE port parameter | `52 42 0C 00 02 <port> <function> <param>` |
+| `0x03` | effect config write (scope + 52B payload) | `52 42 40 00 03 <order> <port>` |
+| `0x05` | set port type | `52 42 08 00 05 <port> <type>` |
+| `0x06` | lights off | `52 42 06 00 06` |
+| `0x07` | auto-detect LED counts | `52 42 06 00 07` |
+| `0x08` | fan speed ownership (RPM control hand-off) | `52 42 07 00 08 <flag>` |
+| `0x0B` | boot lighting (1 = fixed, 255 = memory) | `52 42 07 00 0B <v>` |
+| `0x0C` | boot self-check on/off | `52 42 07 00 0C <v>` |
+| `0x87` | global brightness | `52 42 07 00 87 <b>` |
+| `0xF9` | save current effects to flash | `52 42 06 00 F9 21` |
+| `0xFA` | reset the ARGB controller | `52 42 06 00 FA 42` |
+| `0xFC` | save + reboot controller | `52 42 06 00 FC 44` |
 | `0xFD` | lighting ownership (1 = external app, 0 = release) | `52 42 07 00 FD 01` |
 
-Lighting — uniform animated (all channels same):
+Vendor names (from the decompiled `agreement.py`): `0x02` `ARGB_dan_config(id,
+function, param)`; `0x03` `ARGB_ten_effect(order, num)`; `0x05`
+`argb_fan_set(ser, id)`; `0x06` `argb_fan_light_off`; `0x07`
+`argb_auto_rgb_num`; `0x08` `argb_cp_mcu_fan_speed` — the fan-RPM frames
+(`0xFB`/`0x9D`) only work AFTER this ownership flag is taken; `0xFA`
+`argb_fan_reset`; `0xFC` `argb_fan_save`.
+
+`0x03` scope byte (`order`): `0xFD` = the single port passed as `num`;
+`0xFE` = group-async; `0xFF` = sync-all.
+
+Port types (`0x05`): `1` = static (single color), `2` = palette playback
+(the firmware cycles/interpolates the 12 palette colors; a monochrome
+palette glitches it — the plugin holds the previous palette instead).
+
+The 52-byte payload of `0x03`:
 
 ```
-52 42 3C 00 03 FF FF | 00 03 01 <B> | 16 × (R,G,B)
+[0]     effect id  (0..29 per the vendor docstring "dengxiao_id: 0-29")
+[1]     flow speed (0..6 — the vendor's slider maps (60 - speed) / 10)
+[2..15] effect parameters
+[16..51] palette: 12 × (R,G,B)
 ```
 
-Lighting — per-port static (independent sections):
+The plugin uses effect id `4` (palette playback) for everything.
 
-```
-52 42 08 00 05 <port> 01 <ck>          # set port mode = static
-52 42 3C 00 03 FD <port> | 04 01×5 00 03 03 03 01×3 <B>×3 | palette: 12 × (R,G,B)
-```
-
-The palette's first triplet is the port's static color.
+Streaming: the CH552 firmware processes only ~2 frames per ~30 ms window;
+the plugin round-robins up to 2 ports per frame (~165 ms per port worst
+case) with palette dedupe and periodic full re-sends as drop recovery.
+Large payloads can also be split into multiple 64-byte writes (vendor's
+`hid_write` does `[0x00] + chunk` × 64 bytes).
 
 The protocol was reverse-engineered from USB captures (Wireshark + USBPcap)
-and from the vendor's application bytecode (`agreement.py` / `port.py` inside
-the official installer).
+and from the vendor's application bytecode (`agreement.py` / `port.py` /
+`test.py` decompiled with decompyle3, plus a disassembly of `Sync_light.py`).
+
+### Tools used
+
+- **USB captures**: [USBPcap](https://desowin.org/usbpcap/) + Wireshark/tshark.
+- **Python bytecode**: extracted from the installer with innoextract +
+  pyinstxtractor, decompiled with **decompyle3** (`agreement.py`, `test.py`)
+  and disassembled with **xdis/pydisasm** (`port.py`, `Sync_light.py`).
+- **[REA](https://github.com/morluto/rea) (Reverse Engineer Anything)** was
+  used via its MCP server for the managed (.NET) analysis of the vendor's
+  `CpuServer.exe` (types, methods, string literals, the PawnIO self-repair
+  commands and the localhost port) and for capture inspection.
+- Vendor strings decoded from GBK constants with xdis.
 
 ### License
 
@@ -138,11 +185,21 @@ Probado con el **TISHRIC 1 a 10 ARGB Hub de 5V 3 pines**, conectado
 
 - **10 canales** en SignalRGB (Puerto 1..10): arrastrá componentes (rings de
   fans, bomba, tiras) a cada puerto y configurá la cantidad de LEDs.
-- **Color estático por puerto**: cada puerto mantiene su color independiente,
-  igual que la app oficial — los colores solo se escriben cuando cambian (el
-  firmware los retiene).
+- **Iluminación animada por puerto**: cada puerto muestrea su stream del
+  canvas en una paleta de 12 colores y el firmware las cicla/interpola por
+  sí mismo — animación suave por sección sin streaming pesado (tipo 2). Los
+  streams totalmente estáticos pasan el puerto a modo color fijo (tipo 1)
+  sin tráfico continuo; las paletas degeneradas (monocromas) dentro del modo
+  paleta sostienen la paleta anterior en vez de cambiar de modo (evita el
+  glitch verde del firmware).
+- **Setting "Hub Flow Speed"** (0-6, "liusu" del vendor): la velocidad con
+  que el firmware cicla las paletas.
 - **Modo uniforme animado** (opcional): transmite un color animado para todos
   los canales a la velocidad completa de cuadros.
+- **Efectos Custom incluidos** (`effects/`): "Neon Shift (Custom)" y su preset
+  "NS Ultravioleta" — efectos HTML drop-in para SignalRGB con tus propios
+  colores elegibles. Copialos a
+  `%USERPROFILE%\Documents\WhirlwindFX\Effects\Custom\`.
 - Modo de prueba de puertos (identificar grupos físicos), reflejo del pulso de
   canales, brillo global, ajuste de orden de color, color de apagado.
 - Mantiene el heartbeat del firmware para que el hub no se congele.
@@ -209,6 +266,18 @@ El primer trío de la paleta es el color estático del puerto.
 El protocolo se obtuvo por ingeniería inversa a partir de capturas USB
 (Wireshark + USBPcap) y del bytecode de la aplicación oficial
 (`agreement.py` / `port.py` dentro del instalador).
+
+### Herramientas usadas
+
+- **Capturas USB**: [USBPcap](https://desowin.org/usbpcap/) + Wireshark/tshark.
+- **Bytecode Python**: extraído del instalador con innoextract + pyinstxtractor,
+  decompilado con **decompyle3** (`agreement.py`, `test.py`) y desensamblado
+  con **xdis/pydisasm** (`port.py`, `Sync_light.py`).
+- **[REA](https://github.com/morluto/rea) (Reverse Engineer Anything)** se usó
+  vía su servidor MCP para el análisis managed (.NET) del `CpuServer.exe` del
+  vendor (tipos, métodos, strings, los comandos de auto-reparación de PawnIO y
+  el puerto localhost) y para la inspección de capturas.
+- Los strings del vendor se decodificaron de constantes GBK con xdis.
 
 ### Licencia
 

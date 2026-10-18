@@ -235,6 +235,8 @@ const lastSent = [];     // last color key per port (dedupe writes)
 const modeSet = [];      // 0x05 mode frame sent once per port (avoid flicker)
 const fadedColor = [];   // current smoothed color per port (lerp towards target)
 const lastPalette = [];  // last sent palette hash per port (palette-mode dedupe)
+const modeKind = [];     // 's'=static(type 1) | 'p'=palette-play(type 2)
+const staticSince = [];  // when a degenerate palette was first seen in type 2
 let frameCounter = 0;    // round-robin pointer
 let lastSpeedApplied = -1; // re-send palettes when the flow speed setting changes
 const PaletteTurns = 2;  // refresh palettes at ~1Hz (each port every PaletteTurns×PortCount frames)
@@ -403,6 +405,8 @@ export function Initialize() {
 		modeSet.length = 0;
 		fadedColor.length = 0;
 		lastPalette.length = 0;
+		modeKind.length = 0;
+		staticSince.length = 0;
 		lastSpeedApplied = currentSpeedByte();
 
 		device.log("TISHRIC v5 initialized (vendor per-port protocol)");
@@ -479,32 +483,62 @@ function renderFrame() {
 		return;
 	}
 
-	// Per-port firmware-palette mode — round-robin 1 port per frame.
-	// The firmware cycles/interpolates the palette BY ITSELF => smooth
-	// animation without streaming. Static streams set mode 1 (fixed color).
-	const startIdx = frameCounter;
-	frameCounter = (frameCounter + 1) % PortCount;
+	// Per-port firmware-palette mode — up to 2 ports per frame.
+	// The CH552 processes ~2 frames per 30ms window; 2 writes/turn at 30fps
+	// saturates it without bursts. The firmware cycles/interpolates the
+	// palette BY ITSELF => smooth animation without streaming. Static
+	// streams set mode 1 (fixed color).
+	let budget = 2;
+	let visited = 0;
+	while (visited < PortCount && budget > 0) {
+		const p = frameCounter;
+		frameCounter = (frameCounter + 1) % PortCount;
+		visited += 1;
+		budget -= updatePort(p, b, budget);
+	}
 
-	const p = startIdx;
+	// Drop-recovery: if the hub silently dropped a write (dedupe would
+	// otherwise leave the port stale), force a full re-send roughly
+	// every 10s of idle turns.
+	if (visited === PortCount) {
+		skipCycles += 1;
+		if (skipCycles * PortCount > 300) {
+			skipCycles = 0;
+			for (let i = 0; i < PortCount; i++) lastSent[i] = null;
+		}
+	} else {
+		skipCycles = 0;
+	}
+}
+
+let skipCycles = 0;
+
+// Process one port; returns the number of frames actually written (0-2).
+function updatePort(p, b, budget) {
 	let cc = null;
 	try { cc = device.channel(ChannelArray[p][0]); } catch (e) { cc = null; }
-	if (!cc) return;
+	if (!cc) return 0;
 	const lc = getLedCount(cc);
 	if (!lc) {
 		// empty port: mirror the locate pulse if active; else keep black
 		try {
 			if (typeof cc.shouldPulseColors === "function" && cc.shouldPulseColors()) {
+				if (budget < 2) return 0;
 				const pc = applyOrder(toRgb(device.getChannelPulseColor(ChannelArray[p][0], 40)));
 				writeFrame(setPortMode(p, 1));
 				device.pause(20);
 				writeFrame(perPortColorFrame(p, pc, b));
 				lastSent[p] = `p:${pc[0]},${pc[1]},${pc[2]}`;
+				modeKind[p] = "s";
+				return 2;
 			} else if ((lastSent[p] || "black") !== "black") {
+				if (budget < 1) return 0;
 				writeFrame(perPortColorFrame(p, [0, 0, 0], b));
 				lastSent[p] = "black";
+				return 1;
 			}
 		} catch (e) { /* */ }
-		return;
+		return 0;
 	}
 
 	// Assigned port: sample the canvas stream into a palette
@@ -513,37 +547,64 @@ function renderFrame() {
 		pal = samplePalette(cc, lc);
 	} catch (e) {
 		device.log(`Port ${p + 1}: palette error ${e}`);
-		return;
+		return 0;
 	}
-	if (!pal) return;
+	if (!pal) return 0;
 
-	if (isStaticPalette(pal)) {
-		// static stream: mode 1 with palette[0] = the color (retained by firmware)
+	const staticNow = isStaticPalette(pal);
+
+	if (staticNow && modeKind[p] !== "p") {
+		// Static stream (port in type 1): fixed color, zero ongoing traffic
 		const c = applyOrder(pal[0]);
 		const key = `s:${c[0]},${c[1]},${c[2]}`;
-		if (lastSent[p] !== key) {
-			// 0x05 only when the MODE changes (static <-> cycling); re-sending
-			// it resets the firmware effect and flashes the port.
-			if (!lastSent[p] || !lastSent[p].startsWith("s:")) {
-				writeFrame(setPortMode(p, 1));
-				device.pause(50);
-			}
-			writeFrame(perPortColorFrame(p, c, b));
-			lastSent[p] = key;
+		if (lastSent[p] === key) return 0;
+		const needMode = modeKind[p] !== "s";
+		if (needMode && budget < 2) return 0; // complete mode+color in one turn
+		if (needMode) {
+			writeFrame(setPortMode(p, 1));
+			device.pause(50);
 		}
-	} else {
-		// animated stream: firmware cycles the palette (mode 2) + palette refresh
-		const palApplied = pal.map(applyOrder);
-		const key = `p:${palApplied.map(c => `${c[0]},${c[1]},${c[2]}`).join(";")}`;
-		if (lastSent[p] === key) return;
-		// mode frame only when switching from a different mode
-		if (!lastSent[p] || !lastSent[p].startsWith("p:")) {
-			writeFrame(setPortMode(p, 2));
-			device.pause(20);
-		}
-		writeFrame(paletteFrame(p, palApplied, b));
-		lastSent[p] = key;
+		writeFrame(perPortColorFrame(p, c, b));
+		lastSent[p] = needMode ? null : key; // after a mode flip, re-send once (drop insurance)
+		modeKind[p] = "s";
+		staticSince[p] = 0;
+		return needMode ? 2 : 1;
 	}
+
+	if (staticNow && modeKind[p] === "p") {
+		// Palette degenerated to one color INSIDE type 2. Type 2 + mono
+		// palette glitches the firmware (green blink) — hold the last
+		// palette (it keeps softly cycling) and only settle into type 1
+		// static if the stream stays monochrome for a long while
+		// (breathing/dark phases are shorter than this and must NOT flip).
+		const since = staticSince[p] || (staticSince[p] = Date.now());
+		if (Date.now() - since < 30000) return 0; // hold
+		if (budget < 2) return 0;
+		const c = applyOrder(pal[0]);
+		writeFrame(setPortMode(p, 1));
+		device.pause(50);
+		writeFrame(perPortColorFrame(p, c, b));
+		modeKind[p] = "s";
+		staticSince[p] = 0;
+		lastSent[p] = null; // re-send next turn (hub-burst drop insurance)
+		return 2;
+	}
+
+	// Animated stream: type 2 + palette playback (firmware cycles it)
+	staticSince[p] = 0;
+	const palApplied = pal.map(applyOrder);
+	const key = `p:${palApplied.map(c => `${c[0]},${c[1]},${c[2]}`).join(";")}`;
+	if (lastSent[p] === key && modeKind[p] === "p") return 0;
+	const needMode = modeKind[p] !== "p";
+	if (needMode && budget < 2) return 0;
+	if (needMode) {
+		writeFrame(setPortMode(p, 2));
+		device.pause(20);
+	}
+	writeFrame(paletteFrame(p, palApplied, b));
+	lastSent[p] = needMode ? null : key; // after a mode flip, re-send once (drop insurance)
+	modeKind[p] = "p";
+	return needMode ? 2 : 1;
 }
 
 function mixOf(colors) {
